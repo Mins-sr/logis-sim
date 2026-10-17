@@ -1,11 +1,14 @@
 # Local configuration and secrets; keep the safe configuration example.
 .env
 .env.*
-!.env.example
+config/env/.env
+config/env/.env.*
+!config/env/.env.example
 *.pem
 *.key
 
-# Python environments, caches and local databases.
+# All generated runtime, dependency, build, cache, data, log, and ledger files.
+.local/
 .venv*/
 __pycache__/
 *.py[cod]
@@ -20,12 +23,13 @@ htmlcov/
 *.sqlite3-*
 backups/
 
-# Frontend build output and dependencies.
+# Frontend build output and dependencies (legacy paths are ignored too).
 node_modules/
 dist/
 *.tsbuildinfo
+config/frontend/node_modules/
+config/frontend/dist/
 
 # Local verification logs and manual usage ledger (back up separately).
-.harness/
 *.log
 .DS_Store

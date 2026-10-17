@@ -4,28 +4,31 @@
 
 ```text
 project/
+├── .codex/                # agent and project configuration
+├── .gitignore/.dockerignore
 ├── AGENTS.md
-├── docs/                  # 設計、検証手順、現在の状態
-├── scripts/               # verify.sh、検証・予算集計の補助処理
-├── src/                   # 実プログラムと実行時の設定
-│   ├── app/               # API・DBモデル
-│   ├── shared/            # 共通の業務処理
-│   ├── worker/            # シミュレーション処理
-│   ├── optimizer/         # 最適化サービス
-│   ├── frontend/          # 画面、CSS、HTMLの入口
-│   ├── db/migrations/     # DBマイグレーション
-│   └── proxy/             # Nginxの実行設定
-├── tests/                 # アプリとハーネスのテスト
-└── docker/                # イメージ構築用のDockerfile
+├── config/                # all backend/frontend/docker/env configuration
+│   ├── backend/           # Python dependencies, pytest, Alembic
+│   ├── frontend/          # npm manifest, Vite, TypeScript
+│   ├── docker/            # Compose files and Dockerfiles
+│   └── env/               # safe environment template
+├── docs/                  # design, verification, and current state
+├── scripts/               # development and verification entrypoints
+├── src/                   # application and runtime source
+└── tests/                 # application and harness tests
 ```
 
-開発・ビルドの設定（`package.json`、lockfile、Vite/TypeScript設定、`pyproject.toml`、`requirements*.txt`、`alembic.ini`、Compose設定）と`.codex/`はルートに置きます。`node_modules/`、仮想環境、`dist/`、`.harness/`はローカル生成物で、`src/`やGitに含めません。npmコマンドはルートで実行します。
+`config/` is the only configuration source. Root copies of the npm, Python,
+Compose, Docker, and environment files are intentionally absent. Runtime,
+dependency, build, cache, data, log, ledger, and backup output belongs under
+the ignored `.local/` directory. The directory may be absent in a clean
+checkout. The complete root allowlist is in
+[`config/layout.json`](../config/layout.json) and [`docs/AGENTS.md`](AGENTS.md).
 
-Pythonのパッケージ名は`app`・`shared`・`worker`・`optimizer`を維持し、`src/`を読み込みパスに設定します。`src.app`のようなimportには変更しません。
+Python package names remain `app`, `shared`, `worker`, and `optimizer`; the
+developer entrypoint sets `PYTHONPATH=src` without changing imports.
 
 ## 実装済みの構成
-
-このプロジェクトは物流シミュレーションの初期実装です。まず以下の表で対象を決め、`rg -n 'シンボル' 対象ディレクトリ`で必要な箇所だけ調べます。
 
 | 責務 | 実装 | 関連テスト |
 | --- | --- | --- |
@@ -38,17 +41,38 @@ Pythonのパッケージ名は`app`・`shared`・`worker`・`optimizer`を維持
 | React画面、API呼び出し、通知表示 | `src/frontend/` | 型検査とビルド。単体テストなし |
 | 検証・クレジット記録 | `scripts/` | `tests/harness/` |
 
-ブラウザ → Nginx → API → DB内のコマンド → worker → optimizer、という流れです。状態とイベントはDBに保存し、APIが状態照会とWebSocket配信を担当します。通常起動は`docker compose up -d --build`で、公開入口は既定で`http://localhost:8080`です。API起動時にAlembicのマイグレーションを実行します。
+ブラウザ → Nginx → API → DB内のコマンド → worker → optimizer、という流れ
+です。通常起動は、事前に`scripts/dev.sh migrate apply`を実行してから
+`scripts/dev.sh compose up -d --build`です。公開入口は既定で
+`http://localhost:8080`、Composeのプロジェクト名は`tof-logis`です。
+`pg_data`など既存の名前付きPostgresボリュームは維持します。
 
-Pythonコンテナは3.12、DBはPostgreSQL 16、フロントエンドビルドはNode.js 20です。ローカルAPIテストはSQLiteを使い、ハーネス経由では一時ディレクトリ内にDBを作ります。`src/db/migrations/versions/`にスキーマ変更を追加します。
+## 開発設定とマイグレーション
+
+`scripts/dev.sh setup`だけが依存関係を導入します。他のコマンドは不足時に
+セットアップ方法を表示して終了し、暗黙にインストールしません。frontendは
+`.local/frontend`へ設定をコピーし、`source -> ../../src/frontend`の相対シンボリック
+リンクを作成してViteを実行します。ViteとTypeScriptはリンクを解決し、
+ビルド出力とキャッシュを`.local/frontend`内へ置きます。
+
+`scripts/dev.sh migrate check`はホスト側のAlembicで未適用差分を確認し、
+`migrate apply`は対象DBへ適用します。設定ファイル移行は
+`scripts/migrate_layout.py check|apply`です。どちらも
+`docker compose exec`を使わず、稼働中コンテナへマイグレーションを適用
+しません。PostgreSQLを使う場合は`DATABASE_URL`を設定し、DBがhealthyに
+なってからホスト側で実行します。Compose APIの起動コマンドにも自動
+マイグレーションを含めません。`config/env/.env`があればComposeと
+`scripts/dev.sh migrate`が読み込み、ComposeのPostgreSQLはホストの
+`localhost:${POSTGRES_PORT:-5432}`へ公開されます。
 
 ## 設計と実装の区別
 
-詳しい目標仕様は[設計書v1.2](SLAPStack_VRPB_設計書_v1.2.md)の必要な節だけ参照してください。設計書の記述だけで実装済みと判断しません。
+詳しい目標仕様は[設計書v1.2](SLAPStack_VRPB_設計書_v1.2.md)の必要な節
+だけ参照してください。設計書の記述だけで実装済みと判断しません。
 
-- 現在の倉庫処理は独自の予約・スナップショット用アダプタです。実際のSLAPStackエンジン統合は依存関係・実装にありません。
-- optimizerの地点間所要時間は決定論的な近似値です。道路行列の本格的な取込とは区別します。
+- 現在の倉庫処理は独自の予約・スナップショット用アダプタです。
+- optimizerの地点間所要時間は決定論的な近似値です。
 - VRPBは小規模な入力で列挙法を使い、OR-Tools経路も持ちます。
-- 荷主・ドライバー・ホストは共通React画面を使います。設計書の全操作画面が実装済みではありません。
+- 荷主・ドライバー・ホストは共通React画面を使います。
 
 配置の整理では、これらの業務機能、公開API、DBスキーマを変更しません。

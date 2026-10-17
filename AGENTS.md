@@ -2,9 +2,32 @@
 
 ## 基本構成
 
+- Git対象のルートは`.codex/`、`.gitignore`、`.dockerignore`、`AGENTS.md`、`config/`、`docs/`、`scripts/`、`src/`、`tests/`です。`.git`はGitの管理領域です。
+- 実プログラムは`src/`、テストは`tests/`、設計・状態は`docs/`、検証・開発入口は`scripts/`に置きます。
+- `config/`が設定の唯一の原本です。backend、frontend、docker、envの設定をルートへ複製しません。
+- `.local/`は無視される実行時、依存関係、ビルド、キャッシュ、データ、ログ、利用台帳の領域です。クリーンチェックアウトには存在しなくて構いません。
+- 許可された隠し管理エントリとファイル種別は`config/layout.json`と`docs/AGENTS.md`に明記します。
+
+## 開発コマンド
+
+任意のカレントディレクトリから`scripts/dev.sh`を使用します。依存関係を導入するのは明示的な`setup`だけです。
+
+```sh
+scripts/dev.sh setup
+scripts/dev.sh frontend dev|build|preview
+scripts/dev.sh api|worker|optimizer
+scripts/dev.sh migrate check|apply
+scripts/dev.sh compose [--dev] ...
+scripts/dev.sh usage
+```
+
+データベースのマイグレーションは`migrate apply`で事前に実行し、稼働中のコンテナへ`exec`して適用しません。Composeのプロジェクト名は`tof-logis`で、既存の名前付きPostgresボリュームを維持します。
+
+## 実装配置
+
 - 実プログラムは`src/`へ集約する。APIは`src/app/`、共通処理は`src/shared/`、worker・optimizer・画面・マイグレーション・実行設定も`src/`配下に置く。
-- テストは`tests/`、設計・状態は`docs/`、検証処理は`scripts/`。開発環境とビルド設定はルートまたは`docker/`に置き、`src/`へ混在させない。
-- npmはルートで実行する。Pythonの読み込みパスは`src`とし、既存の`app`などのパッケージ名を維持する。
+- テストは`tests/`、設計・状態は`docs/`、検証処理は`scripts/`。開発環境とビルド設定は`config/`へ集約し、`src/`へ混在させない。
+- npmとPythonは`scripts/dev.sh`経由で実行する。Pythonの読み込みパスは`src`とし、既存の`app`などのパッケージ名を維持する。
 
 ## エージェントの基本規則
 

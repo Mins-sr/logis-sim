@@ -1,13 +1,17 @@
+name: tof-logis
+
 services:
   db:
     image: postgres:16-alpine
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-slapstack}
       POSTGRES_USER: ${POSTGRES_USER:-slapstack}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-slapstack-local-only}
     volumes:
       - pg_data:/var/lib/postgresql/data
-      - ./backups:/backups
+      - ../../.local/backups:/backups
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 3s
@@ -16,9 +20,9 @@ services:
 
   api:
     build:
-      context: .
-      dockerfile: docker/python.Dockerfile
-    command: sh -c "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+      context: ../..
+      dockerfile: config/docker/python.Dockerfile
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-slapstack}:${POSTGRES_PASSWORD:-slapstack-local-only}@db:5432/${POSTGRES_DB:-slapstack}
       OPTIMIZER_URL: http://optimizer:8001
@@ -34,8 +38,8 @@ services:
 
   worker:
     build:
-      context: .
-      dockerfile: docker/python.Dockerfile
+      context: ../..
+      dockerfile: config/docker/python.Dockerfile
     command: python -m worker.main
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-slapstack}:${POSTGRES_PASSWORD:-slapstack-local-only}@db:5432/${POSTGRES_DB:-slapstack}
@@ -48,8 +52,8 @@ services:
 
   optimizer:
     build:
-      context: .
-      dockerfile: docker/python.Dockerfile
+      context: ../..
+      dockerfile: config/docker/python.Dockerfile
     command: uvicorn optimizer.main:app --host 0.0.0.0 --port 8001
     environment:
       DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-slapstack}:${POSTGRES_PASSWORD:-slapstack-local-only}@db:5432/${POSTGRES_DB:-slapstack}
@@ -64,8 +68,8 @@ services:
 
   proxy:
     build:
-      context: .
-      dockerfile: docker/proxy.Dockerfile
+      context: ../..
+      dockerfile: config/docker/proxy.Dockerfile
     ports:
       - "${PROXY_PORT:-8080}:80"
     depends_on:

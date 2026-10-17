@@ -1,7 +1,9 @@
 import os
+from pathlib import Path
 import uuid
 
-os.environ["DATABASE_URL"] = "sqlite:///./test-api.db"
+Path(".local/data").mkdir(parents=True, exist_ok=True)
+os.environ["DATABASE_URL"] = "sqlite:///./.local/data/test-api.db"
 
 from fastapi.testclient import TestClient
 

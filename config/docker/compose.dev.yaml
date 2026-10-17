@@ -1,0 +1,28 @@
+name: tof-logis
+
+services:
+  frontend:
+    image: node:20-alpine
+    working_dir: /workspace
+    command: sh -c "npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ../../.local/frontend:/workspace
+      - ../../src/frontend:/workspace/source
+      - frontend_node_modules:/workspace/node_modules
+    expose:
+      - "5173"
+
+  proxy:
+    build:
+      context: ../..
+      dockerfile: config/docker/proxy.Dockerfile
+      args:
+        DEV_MODE: "true"
+    depends_on:
+      frontend:
+        condition: service_started
+    volumes:
+      - ./nginx.dev.conf:/etc/nginx/conf.d/default.conf:ro
+
+volumes:
+  frontend_node_modules:

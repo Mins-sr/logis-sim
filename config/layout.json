@@ -1,0 +1,50 @@
+{
+  "schema_version": 1,
+  "tracked_root_entries": [
+    ".codex",
+    ".dockerignore",
+    ".gitignore",
+    "AGENTS.md",
+    "config",
+    "docs",
+    "scripts",
+    "src",
+    "tests"
+  ],
+  "hidden_management_entries": [
+    ".git",
+    ".local",
+    ".venv",
+    ".venv312",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".mypy_cache",
+    ".coverage",
+    ".coverage.*",
+    ".DS_Store",
+    ".cache",
+    "node_modules",
+    "dist",
+    "backups"
+  ],
+  "config_paths": {
+    "backend": "config/backend",
+    "frontend": "config/frontend",
+    "docker": "config/docker",
+    "env": "config/env"
+  },
+  "local_paths": {
+    "root": ".local",
+    "frontend": ".local/frontend",
+    "frontend_dependencies": ".local/frontend/node_modules",
+    "frontend_build": ".local/frontend/dist",
+    "frontend_cache": ".local/frontend/.cache",
+    "python": ".local/venv",
+    "data": ".local/data",
+    "logs": ".local/logs",
+    "cache": ".local/cache",
+    "ledger": ".local/ledger",
+    "harness": ".local/harness",
+    "backups": ".local/backups"
+  }
+}

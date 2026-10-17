@@ -1,5 +1,6 @@
 .venv/
 .venv312/
+.local/
 node_modules/
 dist/
 __pycache__/
@@ -7,9 +8,11 @@ __pycache__/
 .pytest_cache/
 *.db
 backups/
-.harness/
 .env
 .env.*
+config/env/.env
+config/env/.env.*
+!config/env/.env.example
 *.pem
 *.key
 .git/

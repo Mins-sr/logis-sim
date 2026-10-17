@@ -13,9 +13,10 @@
     "moduleResolution": "Bundler",
     "resolveJsonModule": true,
     "isolatedModules": true,
+    "preserveSymlinks": true,
     "noEmit": true,
     "jsx": "react-jsx"
   },
-  "include": ["src/frontend"],
+  "include": ["source"],
   "references": []
 }

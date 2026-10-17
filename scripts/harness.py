@@ -17,8 +17,14 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
-SCOPES = ("backend", "frontend", "harness")
+SCOPES = ("layout", "backend", "frontend", "harness")
 BACKEND = ("src/app", "src/shared", "src/worker", "src/optimizer")
+LAYOUT_CONFIG = ROOT / "config/layout.json"
+ROOT_TRACKED_ENTRIES = (".codex", ".dockerignore", ".gitignore", "AGENTS.md", "config", "docs", "scripts", "src", "tests")
+HIDDEN_MANAGEMENT_ENTRIES = (
+    ".git", ".local", ".venv", ".venv312", ".pytest_cache", ".ruff_cache",
+    ".mypy_cache", ".coverage", ".coverage.*", ".DS_Store", ".cache", "node_modules", "dist", "backups",
+)
 MODELS = ("gpt-5.6-luna", "gpt-5.6-sol", "gpt-6-astra")
 JST = timezone(timedelta(hours=9))
 
@@ -30,19 +36,151 @@ class Result:
     log: Path
 
 
+def load_layout(root: Path = ROOT) -> dict:
+    """Load and minimally validate the checked-in layout contract."""
+    path = root / "config/layout.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"layout definition is unreadable: {path}") from error
+    if not isinstance(data, dict) or data.get("schema_version") != 1:
+        raise ValueError("layout definition has an unsupported schema")
+    for key in ("tracked_root_entries", "hidden_management_entries"):
+        values = data.get(key)
+        if not isinstance(values, list) or not all(isinstance(value, str) and value for value in values):
+            raise ValueError(f"layout definition field is invalid: {key}")
+    return data
+
+
+def _matches_hidden(name: str, patterns: tuple[str, ...]) -> bool:
+    return any(name == pattern or (pattern.endswith(".*") and name.startswith(pattern[:-2])) for pattern in patterns)
+
+
+def validate_layout(root: Path = ROOT, *, require_all: bool = True) -> list[str]:
+    """Return layout errors, including unknown entries and kind mismatches."""
+    data = load_layout(root)
+    tracked = tuple(data["tracked_root_entries"])
+    hidden = tuple(data["hidden_management_entries"])
+    errors: list[str] = []
+    try:
+        actual = {entry.name for entry in root.iterdir()}
+    except OSError as error:
+        return [f"root is unreadable: {error}"]
+    for name in sorted(actual - set(tracked)):
+        if _matches_hidden(name, hidden):
+            continue
+        errors.append(f"unknown root entry: {name}")
+    if require_all:
+        for name in tracked:
+            if name not in actual:
+                errors.append(f"missing root entry: {name}")
+    for name in sorted(actual & set(tracked)):
+        path = root / name
+        should_be_directory = name in {".codex", "config", "docs", "scripts", "src", "tests"}
+        if should_be_directory and not path.is_dir():
+            errors.append(f"kind mismatch: {name} must be a directory")
+        elif not should_be_directory and not path.is_file():
+            errors.append(f"kind mismatch: {name} must be a file")
+    # The worktree can contain intentionally deleted legacy root files while
+    # their migration is being staged.  Account for those deletions, but keep
+    # every existing tracked path subject to the root contract.  In particular
+    # a checked-in .local secret must never be hidden by the directory rule.
+    try:
+        tracked_files = subprocess.run(
+            ["git", "-C", str(root), "ls-files", "-z"],
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        if tracked_files.returncode == 0:
+            deleted = set()
+            for command in (("diff", "--name-only", "--diff-filter=D"),
+                            ("diff", "--cached", "--name-only", "--diff-filter=D")):
+                result = subprocess.run(["git", "-C", str(root), *command], capture_output=True,
+                                        text=True, timeout=30, check=False)
+                if result.returncode == 0:
+                    deleted.update(line for line in result.stdout.splitlines() if line)
+            for raw_path in tracked_files.stdout.split(b"\0"):
+                relative = os.fsdecode(raw_path)
+                if not relative or (relative in deleted and not (root / relative).exists()):
+                    continue
+                top = relative.split("/", 1)[0]
+                if top.startswith(".local") or top in {".harness", ".venv", ".venv312"}:
+                    errors.append(f"generated path is tracked: {relative}")
+                elif top not in set(tracked):
+                    errors.append(f"tracked root entry is outside contract: {relative}")
+    except (OSError, subprocess.TimeoutExpired):
+        # Fixture roots used by unit tests are often not Git repositories.
+        pass
+    return errors
+
+
+def validate_ignored_paths(root: Path = ROOT) -> list[str]:
+    """Check that generated local paths are ignored when the tree is Git-backed."""
+    errors: list[str] = []
+    try:
+        layout = load_layout(root)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return ["layout definition is unreadable"]
+
+    def declared_paths(value):
+        if isinstance(value, str):
+            yield value
+        elif isinstance(value, dict):
+            for child in value.values():
+                yield from declared_paths(child)
+
+    paths = set(declared_paths(layout.get("local_paths", {})))
+    # These generated children are part of the local contract even when they
+    # have not been created yet, so check-ignore is deliberately unconditional.
+    paths.update({".local/frontend/node_modules", ".local/frontend/dist", ".local/harness/logs",
+                  ".local/harness/usage.jsonl", ".local/backups"})
+    tracked_result = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                                    capture_output=True, timeout=30, check=False)
+    if tracked_result.returncode != 0:
+        return []
+    tracked = {os.fsdecode(path) for path in tracked_result.stdout.split(b"\0") if path}
+    for relative in sorted(paths):
+        candidates = (relative, relative + "/")
+        ignored = False
+        for candidate in candidates:
+            result = subprocess.run(
+                ["git", "-C", str(root), "check-ignore", "--no-index", candidate],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            if result.returncode == 0:
+                ignored = True
+                break
+        if not ignored:
+            errors.append(f"generated path is not ignored: {relative}")
+        if any(path == relative or path.startswith(relative.rstrip("/") + "/") for path in tracked):
+            errors.append(f"generated path is tracked: {relative}")
+    return errors
+
+
+def layout_errors(root: Path = ROOT) -> list[str]:
+    return [*validate_layout(root), *validate_ignored_paths(root)]
+
+
 def select_scopes(paths: list[str]) -> tuple[str, ...]:
     selected = set()
     for path in paths:
+        if path.startswith(("config/", "scripts/dev.sh", "scripts/migrate.sh", "scripts/migrate_db.py", "scripts/migrate_layout.py")) \
+                or path in ("AGENTS.md", ".gitignore", ".dockerignore"):
+            return SCOPES
         if path.startswith(("scripts/", "tests/harness/")):
             selected.add("harness")
         elif path.startswith(tuple(part + "/" for part in (*BACKEND, "src/db", "tests"))):
             selected.add("backend")
         elif path.startswith("src/frontend/"):
             selected.add("frontend")
-        elif ("/" not in path and path.startswith("package") and path.endswith(".json")) or path in ("vite.config.ts", "tsconfig.json"):
+        elif path.startswith("config/frontend/") or path in ("vite.config.ts", "tsconfig.json") \
+                or ("/" not in path and path.startswith("package") and path.endswith(".json")):
             selected.add("frontend")
         elif path.startswith("docs/"):
-            continue
+            selected.add("layout")
         else:
             return SCOPES
     return tuple(scope for scope in SCOPES if scope in selected)
@@ -114,7 +252,7 @@ def verify(root: Path, scopes: tuple[str, ...]) -> int:
     if not scopes:
         print("SKIP: 検証対象のコード変更なし（文書内容は差分レビューで確認）")
         return 0
-    base = root / ".harness/logs"
+    base = root / ".local/harness/logs"
     base.mkdir(parents=True, exist_ok=True)
     logs = Path(tempfile.mkdtemp(prefix="verify-", dir=base))
     results: list[Result] = []
@@ -131,9 +269,26 @@ def verify(root: Path, scopes: tuple[str, ...]) -> int:
                 raise KeyboardInterrupt
             return result.code == 0
 
+        def layout_step(name: str) -> None:
+            log = logs / f"{name}.log"
+            if not (root / "config/layout.json").exists() and not (root / ".git").exists():
+                log.write_text("SKIP layout definition is absent in a non-project fixture\n", encoding="utf-8")
+                results.append(Result(name, 0, log))
+                return
+            try:
+                errors = layout_errors(root)
+            except (OSError, ValueError, json.JSONDecodeError) as error:
+                errors = [str(error)]
+            if errors:
+                log.write_text("\n".join(f"ERROR {error}" for error in errors) + "\n", encoding="utf-8")
+                results.append(Result(name, 1, log))
+            else:
+                log.write_text("PASS layout\n", encoding="utf-8")
+                results.append(Result(name, 0, log))
+
         def coverage(scope, sources, tests, extra=()):
             data = str(logs / f".{scope}-coverage")
-            config = f"--rcfile={root / 'pyproject.toml'}"
+            config = f"--rcfile={root / 'config/backend/pyproject.toml'}"
             step(f"{scope}-tests", [sys.executable, "-m", "coverage", "run", config,
                  f"--data-file={data}", "--source=" + ",".join(str(root / source) for source in sources),
                  "-m", "pytest", "-q", "--tb=short", "-p", "no:cacheprovider",
@@ -152,18 +307,30 @@ def verify(root: Path, scopes: tuple[str, ...]) -> int:
                 raise ValueError(f"カバレッジ結果がありません: {report}")
 
         try:
+            if "layout" in scopes:
+                layout_step("layout-before")
             if "backend" in scopes:
                 targets = [str(root / part) for part in (*BACKEND, "src/db")]
                 step("backend-syntax", [sys.executable, "-m", "compileall", "-q", *targets])
-                step("backend-lint", [sys.executable, "-m", "ruff", "check", "--select", "E9,F63,F7,F82", *targets])
-                coverage("backend", BACKEND, "tests", ("--ignore", str(root / "tests/harness")))
+                step("backend-lint", [sys.executable, "-m", "ruff", "--config", str(root / "config/backend/pyproject.toml"),
+                                       "check", "--select", "E9,F63,F7,F82", *targets])
+                coverage("backend", BACKEND, "tests", ("--ignore", str(root / "tests/harness"), "-o",
+                                                         "pythonpath=" + os.pathsep.join((str(root / "src"), str(root)))))
             if "frontend" in scopes:
-                step("frontend-build", ["npm", "run", "build"], root)
+                frontend_workspace = root / ".local/frontend"
+                if not frontend_workspace.is_dir():
+                    log = logs / "frontend-build.log"
+                    log.write_text(f"ERROR frontend setup required: run {root / 'scripts/dev.sh'} setup\n", encoding="utf-8")
+                    results.append(Result("frontend-build", 2, log))
+                else:
+                    step("frontend-build", [str(root / "scripts/dev.sh"), "frontend", "build"], root)
                 warnings.append("WARN frontend: 単体テストは未整備（buildは型検査とビルドのみ）")
             if "harness" in scopes:
                 step("harness-lint", [sys.executable, "-m", "ruff", "check", str(root / "scripts"), str(root / "tests/harness")])
                 step("harness-shell", ["bash", "-n", str(root / "scripts/verify.sh")])
                 coverage("harness", ("scripts",), "tests/harness")
+            if "layout" in scopes:
+                layout_step("layout-after")
         except KeyboardInterrupt:
             if not results or results[-1].code != 130:
                 log = logs / "interrupted.log"
@@ -288,6 +455,8 @@ def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
     target = verify_parser.add_mutually_exclusive_group()
     target.add_argument("--scope", choices=SCOPES)
     target.add_argument("--changed", action="store_true")
+    layout_parser = commands.add_parser("layout")
+    layout_parser.add_argument("--root", type=Path, default=root)
     usage = commands.add_parser("usage").add_subparsers(dest="action", required=True)
     record = usage.add_parser("record")
     record.add_argument("--id", required=True)
@@ -302,12 +471,20 @@ def main(argv: list[str] | None = None, *, root: Path = ROOT) -> int:
     settle.add_argument("--source", required=True)
     usage.add_parser("summary").add_argument("--month", default=datetime.now(JST).strftime("%Y-%m"))
     args = parser.parse_args(argv)
-    ledger = root / ".harness/usage.jsonl"
+    ledger = root / ".local/harness/usage.jsonl"
     try:
         if args.command == "verify":
             paths = changed_files(root) if args.changed else None
             scopes = select_scopes(paths) if paths is not None else ((args.scope,) if args.scope else SCOPES)
             return verify(root, scopes)
+        if args.command == "layout":
+            errors = layout_errors(args.root.resolve())
+            if errors:
+                for error in errors:
+                    print(f"ERROR: {error}", file=sys.stderr)
+                return 1
+            print("PASS: layout")
+            return 0
         if args.action == "record":
             source = args.source or ("未計測" if args.credits is None else "")
             record_usage(ledger, args.id, args.model, args.status, args.credits, source, args.at)

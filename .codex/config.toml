@@ -1,0 +1,26 @@
+# Project defaults for new tasks; an explicit UI/CLI selection takes precedence.
+model = "gpt-5.6-luna"
+model_reasoning_effort = "medium"
+
+[features]
+multi_agent = true
+
+[agents]
+max_threads = 2
+max_depth = 1
+
+[agents.worker]
+config_file = "agents/worker.toml"
+description = "実装と対象範囲の検証を担当する、書き込み可能なワーカー。"
+
+[agents.planner]
+config_file = "agents/planner.toml"
+description = "複雑な変更の計画とタスク分解を担当する、読み取り専用のプランナー。"
+
+[agents.reviewer]
+config_file = "agents/reviewer.toml"
+description = "差分の正確性、セキュリティ、テスト不足を確認する、読み取り専用のレビュアー。"
+
+[agents.deep_reviewer]
+config_file = "agents/deep_reviewer.toml"
+description = "高リスク変更を深く検証する、読み取り専用のレビュアー。"

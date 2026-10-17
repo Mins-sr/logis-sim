@@ -1,0 +1,16 @@
+.venv/
+.venv312/
+node_modules/
+dist/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+backups/
+.harness/
+.env
+.env.*
+*.pem
+*.key
+.git/
+.DS_Store

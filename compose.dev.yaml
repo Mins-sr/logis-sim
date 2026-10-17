@@ -1,0 +1,27 @@
+services:
+  frontend:
+    image: node:20-alpine
+    working_dir: /workspace
+    command: sh -c "npm ci && npm run dev -- --host 0.0.0.0"
+    volumes:
+      - ./package.json:/workspace/package.json:ro
+      - ./package-lock.json:/workspace/package-lock.json:ro
+      - ./vite.config.ts:/workspace/vite.config.ts:ro
+      - ./tsconfig.json:/workspace/tsconfig.json:ro
+      - ./src/frontend:/workspace/src/frontend
+      - frontend_node_modules:/workspace/node_modules
+    expose:
+      - "5173"
+
+  proxy:
+    build:
+      context: .
+      dockerfile: docker/proxy.Dockerfile
+      args:
+        DEV_MODE: "true"
+    depends_on:
+      frontend:
+        condition: service_started
+
+volumes:
+  frontend_node_modules:

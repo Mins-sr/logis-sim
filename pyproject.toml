@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 140
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+precision = 1

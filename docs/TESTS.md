@@ -36,9 +36,28 @@ scripts/verify.sh
 backendの80%未達は既知の警告、ハーネスの80%未達はエラーです。Dockerの
 起動確認、ブラウザ試験、依存脆弱性監査はPASSに含みません。
 
-`--changed`は未追跡・未ステージ・ステージ済みを合算し、config、entrypoint、
-layout、ignoreの変更はlayoutを含む全体検証へ振り分けます。文書だけなら
-`SKIP`です。
+`--changed`は未追跡・未ステージ・ステージ済みを合算し、自動検証のscopeだけを選択します。
+`docs/`だけの変更は`layout` scopeへ振り分けられます。文書内容の差分確認は別の人手または
+agentのreviewで行い、`--changed`自体が差分reviewを完了したとはみなしません。
+`AGENTS.md`、ignore、config、entrypoint、migrationの変更はlayoutを含む全体検証へ
+振り分けられます。対象パスが空のときだけ`SKIP`となるため、文書変更を一律に
+`SKIP`とは記録しません。
+
+この更新のように`AGENTS.md`を含む文書変更では、アプリケーション全体を再実行せず
+`scripts/verify.sh --scope layout`を明示します。`--changed`は`AGENTS.md`を含む差分を
+全scopeへ振り分けるためです。
+
+## 受入条件・証跡・再利用
+
+受入条件ごとに、`acceptance -> method -> result and evidence`の順で記録します。
+検証コマンドの終了コード、対象パス、結果ファイルまたはログを証跡に残し、実行検証と
+独立レビューを別欄で扱います。実施していない項目は`not-tested`として保留し、成功扱い
+にしません。
+
+過去の成功結果を再利用できるのは、対象となるソース・設定・依存関係・実行環境が変わらず、
+結果ファイルまたはログの場所を確認できる場合だけです。それ以外は該当scopeを再実行します。
+文書だけの変更では、全体のアプリケーションsuiteを広げず、差分確認と必要なlayout検証を
+行います。
 
 ## 起動・マイグレーション
 
@@ -91,3 +110,33 @@ rg -n 'FAILED|Error|ERROR' .local/harness/logs/verify-対象/*.log
 
 同じ原因の修正・検証が2回失敗したら停止し、原因と不足情報を
 `docs/TASK_STATE.md`へ残します。
+
+## 利用記録
+
+利用記録のCLIは`scripts/dev.sh usage`です。説明用のIDや架空の消費量を実行せず、実在する
+実行の観測値だけを記録します。以下の`<...>`は実際の値への置換例です。
+
+```sh
+scripts/dev.sh usage record --id <unique-run-id> --model <actual-observed-model> --status <success|failed|aborted> --source "<non-empty-source>"
+scripts/dev.sh usage record --id <unique-run-id> --model <actual-observed-model> --status success --credits <measured-task-credits> --source "<non-empty-source>"
+scripts/dev.sh usage settle --id <unique-unmeasured-id> --credits <measured-task-credits> --source "<non-empty-source>"
+scripts/dev.sh usage summary --month <YYYY-MM>
+```
+
+`--credits`を省略したrecordは未計測として保持します。実測値を記録するrecordとsettleには
+空でない`--source`が必要です。settleできるのは同じタスクの未計測レコードだけで、既に
+実測値のあるレコードを上書きしません。親、worker、reviewer、起動失敗はそれぞれ異なる
+IDを使い、重複IDは拒否されます。起動失敗は実行結果に応じて`aborted`または`failed`とし、
+利用できない承認済みモデルを別モデルへ置き換えません。
+
+`--model`は実際に観測したモデルを指定し、statusも実際の結果に合わせます。現在のledgerが
+受け付けるモデルは`scripts/harness.py`の`MODELS`にある`gpt-5.6-luna`、`gpt-5.6-sol`、
+`gpt-6-astra`、statusは`success`、`failed`、`aborted`です。月集計は日本時間（JST）の
+暦月で行い、未計測を含む場合の残額は暫定値です。アカウント全体の利用量、token数、利用率は
+このプロジェクトledgerのクレジットとして記録しません。
+
+起動失敗でモデルを観測できない場合、または観測モデルがledgerで受け付けられない場合は、
+親・worker・reviewer・失敗起動ごとの一意なID、観測できた事実、理由を`docs/TASK_STATE.md`へ
+`ledger-registration pending`として残します。ledgerに登録できないモデルやクレジットを捏造せず、
+別モデルへ置き換えません。受け付け可能な事実が得られた後に、親タスクが既存CLIで記録または
+settleします。

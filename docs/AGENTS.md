@@ -1,5 +1,14 @@
 # Layout rules
 
+## Human-only document
+
+`docs/readme.md` is reserved for the human project owner. Follow the root
+`AGENTS.md` restrictions: do not read, edit, summarize, quote, index, attach,
+copy, or transmit its contents, including through subagents and bulk tools.
+Only content-free metadata checks are allowed. Do not recreate a missing file.
+It is excluded from Git and Docker builds; filesystem mode `600` restricts
+other OS users but cannot distinguish the owner from AI running as that owner.
+
 The repository root has a deliberately small tracked surface:
 
 ```text

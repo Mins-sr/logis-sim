@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from itertools import permutations
+import math
 from typing import Iterable
 
 
@@ -19,10 +20,16 @@ class Job:
     mandatory: bool = True
 
     def __post_init__(self) -> None:
+        if not isinstance(self.id, str) or not self.id or not isinstance(self.location, str) or not self.location:
+            raise ValueError("job id and location are required")
         if self.kind not in {"L", "B"}:
             raise ValueError("job kind must be L or B")
-        if self.pallets <= 0 or self.weight_g < 0:
-            raise ValueError("job quantities must be positive")
+        if isinstance(self.pallets, bool) or not isinstance(self.pallets, int) or self.pallets <= 0:
+            raise ValueError("job pallets must be a positive integer")
+        if isinstance(self.weight_g, bool) or not isinstance(self.weight_g, int) or self.weight_g < 0:
+            raise ValueError("job weight must be a non-negative integer")
+        if self.earliest_ms < 0 or self.latest_ms < 0 or self.service_ms <= 0 or self.revenue_yen < 0:
+            raise ValueError("job timing and revenue must be non-negative")
         if self.earliest_ms > self.latest_ms:
             raise ValueError("earliest_ms must be <= latest_ms")
 
@@ -37,6 +44,12 @@ class VRPBInput:
     distance_cost_yen_per_ms: float = 0.01
     time_cost_yen_per_ms: float = 0.0005
     tardiness_penalty_yen_per_ms: float = 0.005
+
+    def __post_init__(self) -> None:
+        if not self.depot or self.capacity_pallets <= 0 or self.capacity_weight_g < 0:
+            raise ValueError("depot and positive vehicle capacities are required")
+        if not all(math.isfinite(value) for value in (self.distance_cost_yen_per_ms, self.time_cost_yen_per_ms, self.tardiness_penalty_yen_per_ms)):
+            raise ValueError("costs must be finite")
 
 
 @dataclass
@@ -54,12 +67,23 @@ class VRPBResult:
     reason: str | None = None
 
 
+def _node_location(inp: VRPBInput, node: str) -> str:
+    if node == inp.depot:
+        return node
+    return next((job.location for job in inp.jobs if job.id == node), node)
+
+
 def _travel(inp: VRPBInput, a: str, b: str) -> int:
     if a == b:
         return 0
     value = inp.travel_time_ms.get((a, b))
     if value is None:
         value = inp.travel_time_ms.get((b, a))
+    left, right = _node_location(inp, a), _node_location(inp, b)
+    if value is None:
+        value = inp.travel_time_ms.get((left, right))
+    if value is None:
+        value = inp.travel_time_ms.get((right, left))
     if value is None:
         return 1_000_000_000
     return max(0, int(value))
@@ -71,9 +95,8 @@ def _capacity_ok(inp: VRPBInput, linehauls: Iterable[Job]) -> bool:
     return pallets <= inp.capacity_pallets and weight <= inp.capacity_weight_g
 
 
-def _evaluate_route(inp: VRPBInput, jobs_by_location: dict[str, Job], route: tuple[str, ...]) -> VRPBResult | None:
-    linehaul = [job for job in jobs_by_location.values() if job.kind == "L"]
-    backhaul = [job for job in jobs_by_location.values() if job.kind == "B"]
+def _evaluate_route(inp: VRPBInput, jobs_by_id: dict[str, Job], route: tuple[str, ...]) -> VRPBResult | None:
+    linehaul = [job for job in jobs_by_id.values() if job.kind == "L"]
     if not _capacity_ok(inp, linehaul):
         return None
     seen_backhaul = False
@@ -83,13 +106,13 @@ def _evaluate_route(inp: VRPBInput, jobs_by_location: dict[str, Job], route: tup
     load_weight = sum(job.weight_g for job in linehaul)
     tardiness = 0
     travel_total = 0
-    for location in route:
-        job = jobs_by_location[location]
+    for job_id in route:
+        job = jobs_by_id[job_id]
         if job.kind == "L" and seen_backhaul:
             return None
         if job.kind == "B":
             seen_backhaul = True
-        leg = _travel(inp, current, location)
+        leg = _travel(inp, current, job_id)
         if leg >= 1_000_000_000:
             return None
         travel_total += leg
@@ -105,13 +128,13 @@ def _evaluate_route(inp: VRPBInput, jobs_by_location: dict[str, Job], route: tup
             load_weight += job.weight_g
         if load_pallets < 0 or load_weight < 0 or load_pallets > inp.capacity_pallets or load_weight > inp.capacity_weight_g:
             return None
-        current = location
+        current = job_id
     return_leg = _travel(inp, current, inp.depot)
     if return_leg >= 1_000_000_000:
         return None
     travel_total += return_leg
     objective = (
-        sum(jobs_by_location[location].revenue_yen for location in route)
+        sum(jobs_by_id[job_id].revenue_yen for job_id in route)
         - travel_total * inp.distance_cost_yen_per_ms
         - now * inp.time_cost_yen_per_ms
         - tardiness * inp.tardiness_penalty_yen_per_ms
@@ -119,8 +142,8 @@ def _evaluate_route(inp: VRPBInput, jobs_by_location: dict[str, Job], route: tup
     return VRPBResult(
         solution_status="FEASIBLE",
         termination_reason="COMPLETED",
-        route=[inp.depot, *route, inp.depot],
-        selected_job_ids=[jobs_by_location[location].id for location in route],
+        route=[inp.depot, *[jobs_by_id[job_id].location for job_id in route], inp.depot],
+        selected_job_ids=list(route),
         objective_value=objective,
         total_travel_ms=travel_total,
         final_load_pallets=load_pallets,
@@ -145,11 +168,8 @@ def _fallback_solve(inp: VRPBInput) -> VRPBResult:
         # The order structure is explicit: all L permutations, followed by B permutations.
         for l_order in permutations(linehaul):
             for b_order in permutations(selected_backhauls):
-                locations = tuple(job.location for job in (*l_order, *b_order))
-                by_location = {job.location: job for job in all_jobs}
-                if len(by_location) != len(all_jobs):
-                    raise ValueError("job locations must be unique within one plan")
-                candidate = _evaluate_route(inp, by_location, locations)
+                job_ids = tuple(job.id for job in (*l_order, *b_order))
+                candidate = _evaluate_route(inp, {job.id: job for job in all_jobs}, job_ids)
                 if candidate and (best is None or (candidate.objective_value or -1e99) > (best.objective_value or -1e99)):
                     best = candidate
     if best is None:
@@ -181,7 +201,7 @@ def solve_vrpb(inp: VRPBInput) -> VRPBResult:
     backhauls = [job for job in inp.jobs if job.kind == "B"]
     if not _capacity_ok(inp, linehauls):
         return VRPBResult("INFEASIBLE", "COMPLETED", reason="mandatory linehaul exceeds vehicle capacity", solver="ortools")
-    nodes = [inp.depot, *[job.location for job in inp.jobs]]
+    nodes = [inp.depot, *[job.id for job in inp.jobs]]
     manager = pywrapcp.RoutingIndexManager(len(nodes), 1, 0)
     routing = pywrapcp.RoutingModel(manager)
 
@@ -209,10 +229,10 @@ def solve_vrpb(inp: VRPBInput) -> VRPBResult:
     capacity.CumulVar(routing.Start(0)).SetValue(sum(job.pallets for job in linehauls))
 
     for job in linehauls:
-        idx = manager.NodeToIndex(nodes.index(job.location))
+        idx = manager.NodeToIndex(nodes.index(job.id))
         routing.AddDisjunction([idx], 10**12)
     for job in backhauls:
-        idx = manager.NodeToIndex(nodes.index(job.location))
+        idx = manager.NodeToIndex(nodes.index(job.id))
         routing.AddDisjunction([idx], max(1, job.revenue_yen) * 10)
     search = pywrapcp.DefaultRoutingSearchParameters()
     search.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
@@ -229,8 +249,8 @@ def solve_vrpb(inp: VRPBInput) -> VRPBResult:
             route.append(nodes[node])
         index = assignment.Value(routing.NextVar(index))
     route.append(inp.depot)
-    by_location = {job.location: job for job in inp.jobs}
-    result = _evaluate_route(inp, by_location, tuple(route[1:-1]))
+    by_id = {job.id: job for job in inp.jobs}
+    result = _evaluate_route(inp, by_id, tuple(route[1:-1]))
     if result is None:
         return VRPBResult("UNKNOWN", "ERROR", solver="ortools", reason="solver returned a route rejected by domain validation")
     result.solution_status = "FEASIBLE"

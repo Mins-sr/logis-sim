@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import JSON, Boolean, DateTime, Float, Integer, String, Text, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, Float, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .db import Base
@@ -53,7 +53,11 @@ class Membership(Base):
     role: Mapped[str] = mapped_column(String(32))
     is_warehouse_operator: Mapped[bool] = mapped_column(Boolean, default=False)
     is_host: Mapped[bool] = mapped_column(Boolean, default=False)
-    __table_args__ = (UniqueConstraint("session_id", "user_id", name="uq_membership_session_user"),)
+    next_notification_seq: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (
+        UniqueConstraint("session_id", "user_id", name="uq_membership_session_user"),
+        Index("uq_membership_session_host", "session_id", unique=True, sqlite_where=text("role = 'HOST'"), postgresql_where=text("role = 'HOST'")),
+    )
 
 
 class Truck(Base):
@@ -133,6 +137,7 @@ class DomainEvent(Base):
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    __table_args__ = (UniqueConstraint("session_id", "event_seq", name="uq_domain_event_session_seq"),)
 
 
 class Outbox(Base):
@@ -143,6 +148,7 @@ class Outbox(Base):
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (UniqueConstraint("event_id", name="uq_outbox_event"),)
 
 
 class StreamNotification(Base):
@@ -150,21 +156,29 @@ class StreamNotification(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     session_id: Mapped[str] = mapped_column(String(36), index=True)
     user_id: Mapped[str] = mapped_column(String(36), index=True)
+    event_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     seq: Mapped[int] = mapped_column(Integer)
     event_seq: Mapped[int] = mapped_column(Integer)
     state_version: Mapped[int] = mapped_column(Integer)
     sim_time_ms: Mapped[int] = mapped_column(Integer)
     type: Mapped[str] = mapped_column(String(64))
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)
-    __table_args__ = (UniqueConstraint("session_id", "user_id", "seq", name="uq_stream_seq"),)
+    __table_args__ = (
+        UniqueConstraint("session_id", "user_id", "seq", name="uq_stream_seq"),
+        UniqueConstraint("session_id", "user_id", "event_id", name="uq_stream_event"),
+    )
 
 
 class Plan(Base):
     __tablename__ = "plans"
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     session_id: Mapped[str] = mapped_column(String(36), index=True)
+    truck_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     status: Mapped[str] = mapped_column(String(32), default="PROPOSED")
     base_state_version: Mapped[int] = mapped_column(Integer)
+    base_sim_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+    time_limit_ms: Mapped[int] = mapped_column(Integer, default=5_000)
+    calculation_deadline_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     solution_status: Mapped[str] = mapped_column(String(32), default="UNKNOWN")
     termination_reason: Mapped[str] = mapped_column(String(32), default="COMPLETED")
     route: Mapped[list[Any] | None] = mapped_column(JSON, nullable=True)
@@ -173,6 +187,49 @@ class Plan(Base):
     reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class Trip(Base):
+    __tablename__ = "trips"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    plan_id: Mapped[str] = mapped_column(String(36), unique=True, index=True)
+    truck_id: Mapped[str] = mapped_column(String(36), index=True)
+    driver_user_id: Mapped[str] = mapped_column(String(36), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="ACTIVE")
+    phase: Mapped[str] = mapped_column(String(32), default="LOADING")
+    route_index: Mapped[int] = mapped_column(Integer, default=0)
+    current_job_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    next_event_at_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    wait_reason: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    reserved_dock_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reserved_agv_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    reserved_staging_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    reserved_staging_pallets: Mapped[int] = mapped_column(Integer, default=0)
+    outbound_pallets: Mapped[int] = mapped_column(Integer, default=0)
+    outbound_weight_g: Mapped[int] = mapped_column(Integer, default=0)
+    return_pallets: Mapped[int] = mapped_column(Integer, default=0)
+    return_weight_g: Mapped[int] = mapped_column(Integer, default=0)
+    started_sim_time_ms: Mapped[int] = mapped_column(Integer, default=0)
+    completed_sim_time_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (
+        Index("uq_active_trip_per_truck", "truck_id", unique=True, sqlite_where=text("status = 'ACTIVE'"), postgresql_where=text("status = 'ACTIVE'")),
+    )
+
+
+class ResourceReservation(Base):
+    __tablename__ = "resource_reservations"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), index=True)
+    trip_id: Mapped[str] = mapped_column(String(36), index=True)
+    resource_type: Mapped[str] = mapped_column(String(32))
+    resource_id: Mapped[str] = mapped_column(String(36))
+    reserved_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    __table_args__ = (
+        Index("uq_active_resource_reservation", "session_id", "resource_type", "resource_id", unique=True, sqlite_where=text("released_at IS NULL"), postgresql_where=text("released_at IS NULL")),
+    )
 
 
 class Snapshot(Base):

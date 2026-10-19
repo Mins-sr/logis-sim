@@ -61,6 +61,43 @@ agentのreviewで行い、`--changed`自体が差分reviewを完了したとは�
 
 ## 起動・マイグレーション
 
+最初に使う入口は `scripts/start.sh` です。macOSでは `scripts/start.command` を
+Finderからダブルクリックでき、LinuxやSSHでは次のコマンドを実行します。
+
+```sh
+scripts/start.sh
+scripts/start.sh --no-open
+```
+
+この入口はDocker/Compose、Python、Node/npmを確認し、必要なら明示的な
+`scripts/dev.sh setup`を実行した後、他プロジェクトのコンテナ停止、`tof-logis` ComposeのDB起動、ホスト側の
+PostgreSQLマイグレーション、全サービスのbuild/up、`/health/ready`とトップページの
+HTTP確認を順番に行います。起動URLは `http://127.0.0.1:8080/` として表示されます。
+失敗した工程のログは `.local/logs/start/` に残ります。停止は
+`scripts/dev.sh compose down`（名前付きDBボリュームは保持）です。
+8080が使用中の場合は、例えば `PROXY_PORT=8081 scripts/start.sh --no-open` として
+localhost内の別ポートを指定できます。
+
+他コンテナ停止は、接続中のDocker環境に対して毎回、ポート競合に関係なく実施します。
+`com.docker.compose.project`が正確に`tof-logis`と一致するものを除き、起動中の
+全コンテナを対象とします。所属なしも対象、停止済みは対象外です。確認入力はありません。
+コンテナIDを指定して通常停止（終了待機10秒）し、一覧取得・停止・再確認は各工程で
+`--timeout`の期限を適用します。停止後に他コンテナが残存・再起動・新規起動していれば
+DB起動前に失敗します。再確認後の起動を継続監視する機能はありません。
+コンテナ・イメージ・ボリュームを削除せず、起動失敗時・終了時も他サービスを自動再開しません。
+必要なサービスは利用者が再開します。Docker自体やホストの通常プロセスは停止しません。
+対象一覧と結果は起動表示および`.local/logs/start/containers-{list,stop,verify}.log`に残ります。
+
+この工程の回帰テストは`tests/harness/test_start.py`でDocker呼び出しを差し替え、
+対象の判定、停止失敗・期限超過、再確認時の残存、DB起動順序を確認します。
+実機では、MacのダブルクリックとLinuxの実行で、別プロジェクトが停止し、`tof-logis`と
+データが保持されることを確認してください。実行前に他のDocker作業への影響を把握し、
+必要なサービスは検証後にそのサービスの手順で再開します。
+
+役割入口は、ログイン成功後に同じブラウザの別タブへ切替を通知し、別タブを入口へ戻します。
+別タブでは、片方のログイン・役割切替が完了してから次の操作を行ってください。同時に異なる役割へ
+ログインする操作や、BroadcastChannelに対応しないブラウザでの複数タブ利用は対象外です。
+
 ```sh
 scripts/dev.sh api
 scripts/dev.sh worker

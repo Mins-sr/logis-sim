@@ -11,8 +11,8 @@ from typing import Any
 
 from fastapi import Cookie, Depends, FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from sqlalchemy import desc, func, select, text
+from pydantic import BaseModel, Field, StrictInt, StrictStr
+from sqlalchemy import MetaData, Table, desc, inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -26,11 +26,13 @@ from .models import (
     Membership,
     Outbox,
     Plan,
+    ResourceReservation,
     SimulationSession,
     Snapshot,
     StagingArea,
     StreamNotification,
     Truck,
+    Trip,
     User,
     utcnow,
 )
@@ -50,19 +52,19 @@ class LoginRequest(BaseModel):
 
 
 class JoinRequest(BaseModel):
-    role: str = Field(pattern="^(SHIPPER|DRIVER|WAREHOUSE|HOST)$")
+    role: str = Field(pattern="^(SHIPPER|DRIVER|HOST)$")
 
 
 class CommandRequest(BaseModel):
-    type: str
-    idempotency_key: str = Field(min_length=1, max_length=128)
-    expected_entity_version: int = 0
+    type: StrictStr = Field(min_length=1, max_length=64)
+    idempotency_key: StrictStr = Field(min_length=1, max_length=128)
+    expected_entity_version: StrictInt = Field(default=0, ge=0)
     payload: dict[str, Any] = Field(default_factory=dict)
 
 
 class PlanRequest(BaseModel):
-    truck_id: str | None = None
-    time_limit_ms: int = 5_000
+    truck_id: StrictStr = Field(min_length=1, max_length=36)
+    time_limit_ms: StrictInt = Field(default=5_000, gt=0, le=60_000)
 
 
 def user_from_token(db: Session, token: str | None) -> User:
@@ -118,7 +120,9 @@ def serialize_state(db: Session, session: SimulationSession, membership: Members
     trucks = list(db.scalars(select(Truck).where(Truck.session_id == session.id).order_by(Truck.name)))
     docks = list(db.scalars(select(Dock).where(Dock.session_id == session.id).order_by(Dock.name)))
     staging = list(db.scalars(select(StagingArea).where(StagingArea.session_id == session.id).order_by(StagingArea.name)))
-    visible_jobs = jobs if membership.role in {"HOST", "WAREHOUSE"} else [job for job in jobs if job.status in {"OPEN", "CONTRACTED", "IN_PROGRESS", "COMPLETED"}]
+    trips = list(db.scalars(select(Trip).where(Trip.session_id == session.id).order_by(Trip.id)))
+    reservations = list(db.scalars(select(ResourceReservation).where(ResourceReservation.session_id == session.id, ResourceReservation.released_at.is_(None)).order_by(ResourceReservation.resource_type, ResourceReservation.resource_id)))
+    visible_jobs = jobs if membership.role == "HOST" else [job for job in jobs if job.status in {"OPEN", "CONTRACTED", "IN_PROGRESS", "COMPLETED"}]
     return {
         "session": {
             "id": session.id,
@@ -146,30 +150,26 @@ def serialize_state(db: Session, session: SimulationSession, membership: Members
         ],
         "docks": [{"id": dock.id, "name": dock.name, "occupied_by": dock.occupied_by, "version": dock.version} for dock in docks],
         "staging_areas": [{"id": area.id, "name": area.name, "capacity_pallets": area.capacity_pallets, "used_pallets": area.used_pallets} for area in staging],
+        "trips": [
+            {
+                "id": trip.id,
+                "plan_id": trip.plan_id,
+                "truck_id": trip.truck_id,
+                "status": trip.status,
+                "phase": trip.phase,
+                "current_job_id": trip.current_job_id,
+                "next_event_at_ms": trip.next_event_at_ms,
+                "wait_reason": trip.wait_reason,
+                "route_index": trip.route_index,
+                "progress": {"outbound_pallets": trip.outbound_pallets, "return_pallets": trip.return_pallets},
+            }
+            for trip in trips
+        ],
+        "resource_reservations": [
+            {"trip_id": row.trip_id, "resource_type": row.resource_type, "resource_id": row.resource_id}
+            for row in reservations
+        ],
     }
-
-
-def publish_outbox(db: Session, session_id: str) -> None:
-    memberships = list(db.scalars(select(Membership).where(Membership.session_id == session_id)))
-    outbox_rows = list(db.scalars(select(Outbox).where(Outbox.session_id == session_id, Outbox.processed_at.is_(None)).order_by(Outbox.id).limit(200)))
-    for row in outbox_rows:
-        for membership in memberships:
-            last_seq = db.scalar(select(func.max(StreamNotification.seq)).where(StreamNotification.session_id == session_id, StreamNotification.user_id == membership.user_id)) or 0
-            notification = StreamNotification(
-                id=uid(),
-                session_id=session_id,
-                user_id=membership.user_id,
-                seq=int(last_seq) + 1,
-                event_seq=int(row.payload.get("event_seq", 0)),
-                state_version=int(row.payload.get("state_version", 0)),
-                sim_time_ms=int(row.payload.get("sim_time_ms", 0)),
-                type=row.type,
-                payload=row.payload,
-            )
-            db.add(notification)
-        row.processed_at = utcnow()
-    if outbox_rows:
-        db.commit()
 
 
 def seed_database() -> None:
@@ -252,19 +252,97 @@ def list_sessions(user: User = Depends(current_user), db: Session = Depends(get_
     return [{"id": row.id, "name": row.name, "status": row.status, "state_version": row.state_version} for row in rows]
 
 
+def _join_legacy_membership(session_id: str, body: JoinRequest, user: User, db: Session) -> dict[str, Any]:
+    """Recover an administrator HOST without selecting columns added by 0002."""
+    metadata = MetaData()
+    memberships = Table("memberships", metadata, autoload_with=db.get_bind())
+    users = Table("users", metadata, autoload_with=db.get_bind())
+    existing = db.execute(
+        select(memberships).where(memberships.c.session_id == session_id, memberships.c.user_id == user.id)
+    ).mappings().first()
+    host_rows = list(
+        db.execute(
+            select(memberships).where(memberships.c.session_id == session_id, memberships.c.role == "HOST").with_for_update()
+        ).mappings()
+    )
+    admin_ids = set(db.scalars(select(users.c.id).where(users.c.is_admin.is_(True))).all())
+    valid_hosts = [row for row in host_rows if row["user_id"] in admin_ids]
+    current_host = valid_hosts[0] if valid_hosts else None
+    if body.role == "HOST" and current_host is not None and current_host["user_id"] != user.id:
+        raise HTTPException(status_code=409, detail="session already has an administrator HOST")
+    if body.role == "HOST" and current_host is None:
+        for stale_host in host_rows:
+            if existing is None or stale_host["id"] != existing["id"]:
+                db.execute(
+                    memberships.update()
+                    .where(memberships.c.id == stale_host["id"])
+                    .values(role="SHIPPER", is_host=False, is_warehouse_operator=False)
+                )
+    if existing is not None:
+        if existing["role"] == "HOST" and body.role != "HOST":
+            raise HTTPException(status_code=409, detail="HOST role cannot be changed")
+        db.execute(
+            memberships.update()
+            .where(memberships.c.id == existing["id"])
+            .values(role=body.role, is_host=body.role == "HOST", is_warehouse_operator=body.role == "HOST")
+        )
+        db.commit()
+        return {"membership_id": existing["id"], "role": body.role, "session_id": session_id}
+    membership_id = uid()
+    db.execute(
+        memberships.insert().values(
+            id=membership_id,
+            session_id=session_id,
+            user_id=user.id,
+            role=body.role,
+            is_host=body.role == "HOST",
+            is_warehouse_operator=body.role == "HOST",
+        )
+    )
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="membership already exists")
+    return {"membership_id": membership_id, "role": body.role, "session_id": session_id}
+
+
 @app.post("/api/v1/sessions/{session_id}/join")
 def join(session_id: str, body: JoinRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     session = db.get(SimulationSession, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="session not found")
+    if body.role == "HOST" and not user.is_admin:
+        raise HTTPException(status_code=403, detail="administrator credentials required for HOST")
+    db.execute(select(SimulationSession).where(SimulationSession.id == session_id).with_for_update())
+    if "next_notification_seq" not in {column["name"] for column in inspect(db.get_bind()).get_columns("memberships")}:
+        return _join_legacy_membership(session_id, body, user, db)
     existing = db.scalar(select(Membership).where(Membership.session_id == session_id, Membership.user_id == user.id))
+    host_memberships = list(db.scalars(select(Membership).where(Membership.session_id == session_id, Membership.role == "HOST").with_for_update()))
+    valid_hosts = [membership for membership in host_memberships if (db.get(User, membership.user_id) or User(is_admin=False)).is_admin]
+    current_host = valid_hosts[0] if valid_hosts else None
+    if body.role == "HOST" and current_host is not None and current_host.user_id != user.id:
+        raise HTTPException(status_code=409, detail="session already has an administrator HOST")
+    if body.role == "HOST" and current_host is None:
+        # A legacy non-admin HOST can leave the session without a management
+        # path. An authenticated administrator may take over, while the
+        # migration remains intentionally fail-closed until this repair is
+        # completed and rerun.
+        for stale_host in host_memberships:
+            if existing is None or stale_host.id != existing.id:
+                stale_host.role = "SHIPPER"
+                stale_host.is_host = False
+                stale_host.is_warehouse_operator = False
+        db.flush()
     if existing:
+        if existing.role == "HOST" and body.role != "HOST":
+            raise HTTPException(status_code=409, detail="HOST role cannot be changed")
         existing.role = body.role
-        existing.is_host = body.role == "HOST" or user.is_admin
-        existing.is_warehouse_operator = body.role in {"HOST", "WAREHOUSE"}
+        existing.is_host = body.role == "HOST"
+        existing.is_warehouse_operator = body.role == "HOST"
         db.commit()
         return {"membership_id": existing.id, "role": existing.role, "session_id": session_id}
-    membership = Membership(id=uid(), session_id=session_id, user_id=user.id, role=body.role, is_host=body.role == "HOST" or user.is_admin, is_warehouse_operator=body.role in {"HOST", "WAREHOUSE"})
+    membership = Membership(id=uid(), session_id=session_id, user_id=user.id, role=body.role, is_host=body.role == "HOST", is_warehouse_operator=body.role == "HOST")
     db.add(membership)
     try:
         db.commit()
@@ -277,15 +355,18 @@ def join(session_id: str, body: JoinRequest, user: User = Depends(current_user),
 @app.get("/api/v1/sessions/{session_id}/state")
 def state(session_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     session, membership = require_session(db, session_id, user)
-    publish_outbox(db, session_id)
     return serialize_state(db, session, membership)
 
 
 @app.post("/api/v1/sessions/{session_id}/commands", status_code=202)
 def create_command(session_id: str, body: CommandRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     session, membership = require_session(db, session_id, user)
-    if body.type in {"CREATE_JOB", "ACCEPT_JOB"} and membership.role not in {"SHIPPER", "DRIVER", "HOST"}:
-        raise HTTPException(status_code=403, detail="role cannot submit this command")
+    if body.type == "CREATE_JOB" and membership.role not in {"SHIPPER", "HOST"}:
+        raise HTTPException(status_code=403, detail="shipper or host role required")
+    if body.type == "ACCEPT_JOB" and membership.role != "DRIVER":
+        raise HTTPException(status_code=403, detail="driver role required")
+    if body.type in {"PAUSE", "RESUME", "SET_SPEED"} and not (membership.role == "HOST" and membership.is_host and user.is_admin):
+        raise HTTPException(status_code=403, detail="host role required")
     existing = db.scalar(select(Command).where(Command.session_id == session_id, Command.user_id == user.id, Command.idempotency_key == body.idempotency_key))
     if existing:
         if existing.type != body.type or existing.payload != body.payload:
@@ -318,13 +399,26 @@ def command_status(command_id: str, user: User = Depends(current_user), db: Sess
 @app.post("/api/v1/sessions/{session_id}/plans", status_code=202)
 def create_plan(session_id: str, body: PlanRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict[str, Any]:
     session, membership = require_session(db, session_id, user)
-    if membership.role not in {"DRIVER", "HOST", "WAREHOUSE"}:
+    if membership.role not in {"DRIVER", "HOST"}:
         raise HTTPException(status_code=403, detail="driver or host role required")
-    plan = Plan(id=uid(), session_id=session_id, base_state_version=session.state_version)
+    truck = db.get(Truck, body.truck_id)
+    if truck is None or truck.session_id != session_id:
+        raise HTTPException(status_code=404, detail="truck not found")
+    if membership.role == "DRIVER" and truck.assigned_user_id != user.id:
+        raise HTTPException(status_code=403, detail="truck is not assigned to driver")
+    plan = Plan(
+        id=uid(),
+        session_id=session_id,
+        truck_id=truck.id,
+        base_state_version=session.state_version,
+        base_sim_time_ms=session.current_sim_time_ms,
+        time_limit_ms=body.time_limit_ms,
+        calculation_deadline_at=utcnow() + timedelta(milliseconds=body.time_limit_ms),
+    )
     db.add(plan)
     db.commit()
     # The optimizer is a separate service; the worker/optimizer poller can recover this request.
-    return {"plan_id": plan.id, "status": plan.status, "base_state_version": plan.base_state_version, "optimizer_url": os.getenv("OPTIMIZER_URL", "http://optimizer:8001")}
+    return {"plan_id": plan.id, "status": plan.status, "truck_id": plan.truck_id, "base_state_version": plan.base_state_version, "base_sim_time_ms": plan.base_sim_time_ms, "calculation_deadline_at": plan.calculation_deadline_at, "optimizer_url": os.getenv("OPTIMIZER_URL", "http://optimizer:8001")}
 
 
 @app.get("/api/v1/sessions/{session_id}/plans/{plan_id}")
@@ -333,7 +427,7 @@ def get_plan(session_id: str, plan_id: str, user: User = Depends(current_user), 
     plan = db.get(Plan, plan_id)
     if plan is None or plan.session_id != session_id:
         raise HTTPException(status_code=404, detail="plan not found")
-    return {"id": plan.id, "status": plan.status, "base_state_version": plan.base_state_version, "solution_status": plan.solution_status, "termination_reason": plan.termination_reason, "route": plan.route, "selected_job_ids": plan.selected_job_ids, "objective_value": plan.objective_value, "reason": plan.reason}
+    return {"id": plan.id, "status": plan.status, "truck_id": plan.truck_id, "base_state_version": plan.base_state_version, "base_sim_time_ms": plan.base_sim_time_ms, "time_limit_ms": plan.time_limit_ms, "calculation_deadline_at": plan.calculation_deadline_at, "solution_status": plan.solution_status, "termination_reason": plan.termination_reason, "route": plan.route, "selected_job_ids": plan.selected_job_ids, "objective_value": plan.objective_value, "reason": plan.reason}
 
 
 @app.websocket("/ws/v1/sessions/{session_id}")
@@ -349,7 +443,6 @@ async def websocket_stream(websocket: WebSocket, session_id: str, db: Session = 
     last_seq = int(websocket.query_params.get("last_seq", "0"))
     try:
         while True:
-            publish_outbox(db, session_id)
             notifications = list(db.scalars(select(StreamNotification).where(StreamNotification.session_id == session_id, StreamNotification.user_id == user.id, StreamNotification.seq > last_seq).order_by(StreamNotification.seq).limit(100)))
             for notification in notifications:
                 await websocket.send_json({"seq": notification.seq, "event_seq": notification.event_seq, "sim_time": notification.sim_time_ms, "state_version": notification.state_version, "type": notification.type, "payload": notification.payload})

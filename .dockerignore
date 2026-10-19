@@ -1,4 +1,5 @@
 .venv/
+/docs/readme.md
 .venv312/
 .local/
 node_modules/

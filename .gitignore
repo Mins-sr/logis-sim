@@ -1,4 +1,5 @@
 # Local configuration and secrets; keep the safe configuration example.
+/docs/readme.md
 .env
 .env.*
 config/env/.env

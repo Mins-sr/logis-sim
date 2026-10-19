@@ -6,6 +6,7 @@ Path(".local/data").mkdir(parents=True, exist_ok=True)
 os.environ["DATABASE_URL"] = "sqlite:///./.local/data/test-api.db"
 
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from app.db import Base, SessionLocal, engine
 from app.main import app
@@ -62,14 +63,19 @@ def test_api_auth_roles_conflicts_and_notifications():
         assert client.get("/api/v1/sessions/missing/state").status_code == 404
         assert client.post("/api/v1/sessions/missing/join", json={"role": "SHIPPER"}).status_code == 404
 
-        assert client.post(f"/api/v1/sessions/{session_id}/join", json={"role": "WAREHOUSE"}).status_code == 200
+        assert client.post(f"/api/v1/sessions/{session_id}/join", json={"role": "WAREHOUSE"}).status_code == 422
+        assert client.post(f"/api/v1/sessions/{session_id}/join", json={"role": "DRIVER"}).status_code == 200
         forbidden = client.post(
             f"/api/v1/sessions/{session_id}/commands",
             json={"type": "CREATE_JOB", "idempotency_key": "forbidden-1", "payload": {}},
         )
         assert forbidden.status_code == 403
         assert client.post(f"/api/v1/sessions/{session_id}/join", json={"role": "SHIPPER"}).status_code == 200
-        assert client.post(f"/api/v1/sessions/{session_id}/plans", json={}).status_code == 403
+        assert client.post(f"/api/v1/sessions/{session_id}/plans", json={}).status_code == 422
+        assert client.post(
+            f"/api/v1/sessions/{session_id}/commands",
+            json={"type": "SET_SPEED", "idempotency_key": "shipper-speed-1", "payload": {"speed": 10}},
+        ).status_code == 403
 
         key = "conflict-" + uuid.uuid4().hex
         payload = {"kind": "B", "location": "Conflict", "pallets": 1, "weight_g": 1}
@@ -91,3 +97,34 @@ def test_api_auth_roles_conflicts_and_notifications():
             db.commit()
         state = client.get(f"/api/v1/sessions/{session_id}/state")
         assert state.status_code == 200
+
+
+def test_admin_can_recover_session_when_only_non_admin_host_membership_remains():
+    from app.main import JoinRequest, join
+    from app.models import Membership, User
+
+    with SessionLocal() as db:
+        session_id = "demo-session"
+        admin = db.scalar(select(User).where(User.username == "admin"))
+        shipper = db.scalar(select(User).where(User.username == "shipper"))
+        assert admin and shipper
+        admin_membership = db.scalar(select(Membership).where(Membership.session_id == session_id, Membership.user_id == admin.id))
+        shipper_membership = db.scalar(select(Membership).where(Membership.session_id == session_id, Membership.user_id == shipper.id))
+        assert admin_membership and shipper_membership
+        admin_membership.role = "SHIPPER"
+        admin_membership.is_host = False
+        admin_membership.is_warehouse_operator = False
+        db.commit()
+        shipper_membership.role = "HOST"
+        shipper_membership.is_host = True
+        shipper_membership.is_warehouse_operator = True
+        db.commit()
+
+        result = join(session_id, JoinRequest(role="HOST"), user=admin, db=db)
+        assert result["role"] == "HOST"
+        db.refresh(admin_membership)
+        db.refresh(shipper_membership)
+        assert admin_membership.role == "HOST"
+        assert admin_membership.is_host is True
+        assert shipper_membership.role == "SHIPPER"
+        assert shipper_membership.is_host is False

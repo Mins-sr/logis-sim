@@ -1,5 +1,7 @@
 # tof-logis
 
+![tof-logis pixel art banner](assets/tof-logis-pixel-banner.png)
+
 単一デポの配送市場シミュレーションです。荷主、ドライバー／運送事業者、管理者／ホスト／倉庫運営者の3役で、案件登録から受注、計画生成、出発、配送、帰庫、倉庫資源の解放までを検証できます。
 
 ## 役割
